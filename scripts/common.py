@@ -138,6 +138,19 @@ def etherscan_key():
     return None
 
 
+def moralis_key():
+    k = os.environ.get("MORALIS_API_KEY")
+    if k:
+        return k.strip()
+    p = os.path.expanduser("~/.config/wallet-trace/moralis.key")
+    if os.path.exists(p):
+        return open(p).read().strip()
+    return None
+
+
+MORALIS_CHAIN = {"bsc": "bsc", "eth": "eth", "base": "base", "arb": "arbitrum"}
+
+
 def solana_rpc_url():
     return os.environ.get("SOLANA_RPC_URL") or "https://api.mainnet-beta.solana.com"
 

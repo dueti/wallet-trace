@@ -11,7 +11,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import EVM_CHAINS, is_evm_address, is_solana_address, rpc, etherscan_key_for, save_json, load_json, log  # noqa: E402
+from common import EVM_CHAINS, MORALIS_CHAIN, is_evm_address, is_solana_address, rpc, etherscan_key_for, moralis_key, save_json, load_json, log  # noqa: E402
 from analyze import analyze  # noqa: E402
 
 
@@ -56,6 +56,14 @@ def run_chain(chain, address, args):
         elif chain == "solana":
             from fetch_solana import fetch
             data = fetch(address, since, args.max_tx)
+        elif args.scan:
+            from fetch_rpc import fetch_raw
+            from fetch_evm import build_trades
+            raw, source = fetch_raw(chain, address, since, threads=args.threads)
+            trades, transfers = build_trades(chain, address, raw)
+            data = {"chain": chain, "address": address, "source": source, "fetched_at": int(time.time()), "native": EVM_CHAINS[chain]["native"],
+                    "trades": trades, "transfers": transfers, "raw_counts": {k: len(v) for k, v in raw.items()},
+                    "note": "rpc-scan: plain native transfers (funding) and failed txs are not visible; sells paid in raw native without a WBNB event are kept with usd=0 (note=unpriced)."}
         else:
             from fetch_evm import fetch
             data = fetch(chain, address, since)
@@ -77,6 +85,8 @@ def main():
     ap.add_argument("--max-tx", type=int, default=3000, help="solana: max signatures to parse")
     ap.add_argument("--debank-dump", default=None, help="DeBank history page text dump (fallback for bsc without API key)")
     ap.add_argument("--dump-time", default=None, help='"YYYY-MM-DD HH:MM" when the DeBank dump was taken')
+    ap.add_argument("--scan", action="store_true", help="key-free full history via public RPC log scan (bsc; slow: ~1h per 70 days)")
+    ap.add_argument("--threads", type=int, default=8, help="parallel RPC calls for --scan")
     ap.add_argument("--no-fetch", action="store_true", help="re-analyze existing trades.json only")
     ap.add_argument("--refresh", action="store_true", help="ignore the 1h cache")
     ap.add_argument("--quiet", action="store_true", help="print only output paths")
@@ -93,11 +103,12 @@ def main():
         chains = [c for c, _ in detect_evm_chains(a)] or ["bsc"]
     else:
         sys.exit("unrecognised address format")
-    need = [c for c in chains if c != "solana" and not EVM_CHAINS[c]["blockscout"] and not etherscan_key_for(c)]
-    if need and not args.debank_dump and not args.no_fetch:
+    need = [c for c in chains if c != "solana" and not EVM_CHAINS[c]["blockscout"] and not etherscan_key_for(c) and not (moralis_key() and c in MORALIS_CHAIN)]
+    if need and not args.debank_dump and not args.no_fetch and not args.scan:
         log(f"[!] {','.join(need)}: no free API (Etherscan free plan excludes bsc/base). Options:\n"
-            f"    a) DeBank fallback: dump the history page and pass --debank-dump FILE (see SKILL.md)\n"
-            f"    b) paid Etherscan plan: export ETHERSCAN_PAID=1\n"
+            f"    a) --scan : key-free full history from public RPC logs (slow, ~1h per 70 days, resumable)\n"
+            f"    b) DeBank fallback: dump the history page and pass --debank-dump FILE (last ~1000 rows only)\n"
+            f"    c) paid key: Moralis (~/.config/wallet-trace/moralis.key) or Etherscan paid + ETHERSCAN_PAID=1\n"
             f"    continuing with the other chains: {[c for c in chains if c not in need]}")
         chains = [c for c in chains if c not in need]
     if not chains:

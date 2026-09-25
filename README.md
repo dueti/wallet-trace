@@ -36,6 +36,7 @@ python3 scripts/wallet_trace.py 0x... --no-fetch  # 只重算，不重新抓
 | `--out` | `~/Desktop/wallet-trace` | 输出根目录 |
 | `--max-tx` | 3000 | Solana 最多解析多少笔 |
 | `--refresh` | | 忽略 1 小时缓存重新抓 |
+| `--scan` | | BSC 无 key 全量：公共 RPC 扫日志，慢但完整，可断点续跑 |
 | `--debank-dump FILE` | | BSC 兜底：用 DeBank 页面导出文本代替 API |
 
 输出在 `~/Desktop/wallet-trace/<链>-<地址前6>-<后4>/`：
@@ -51,15 +52,27 @@ python3 scripts/wallet_trace.py 0x... --no-fetch  # 只重算，不重新抓
 | 链 | 数据源 |
 |---|---|
 | eth / arb | Etherscan V2（免费 key）；没 key 自动走 Blockscout 公共 API |
-| base | Blockscout 公共 API（Etherscan 免费版不覆盖 base，脚本会自动回退） |
-| bsc | **没有免费 API**：Etherscan 免费版不覆盖，BscScan 网页有人机验证。走下面的 DeBank 兜底，或付费版 Etherscan + `ETHERSCAN_PAID=1` |
+| base | Blockscout 公共 API（无 key）。Etherscan 免费版不覆盖 base |
+| bsc | 没有免费索引 API（Etherscan 免费版不覆盖，Moralis 已转付费）。**`--scan`：纯公共 RPC 扫日志，无 key、全量、可断点续跑，约 1 小时/70 天**；急用就走 DeBank 兜底（只有最近约 1000 条）；有付费 key 则直连 |
 | solana | 公共 RPC（慢，每笔约 0.35s；设 `SOLANA_RPC_URL` 用 Helius 等私有节点会快很多） |
 
 Etherscan key 放任一处：环境变量 `ETHERSCAN_API_KEY`、文件 `~/.config/wallet-trace/etherscan.key`、macOS 钥匙串 service `etherscan-api`。
+付费 key 可选：Moralis 放 `MORALIS_API_KEY` 或 `~/.config/wallet-trace/moralis.key`；Etherscan 付费版加 `ETHERSCAN_PAID=1`。
 
 价格：主币（BNB/ETH/SOL）按 CoinGecko 当日价折算成美元；代币现价、市值、开池时间来自 DexScreener（按 24h 成交量选池，避开假池）。
 
-### BSC 的 DeBank 兜底
+### BSC 无 key 全量：`--scan`
+
+```bash
+python3 scripts/wallet_trace.py 0x... --chain bsc --scan --days 90
+```
+
+不需要任何 key：用 bloXroute 公共节点按 topic 扫钱包的所有 ERC20 Transfer 事件（一次 5000 块），再逐笔拉 receipt 还原买卖：
+token 腿来自 Transfer 事件，付出的 BNB 是 tx.value，收到的 BNB 是同一笔里 WBNB 的 Withdrawal 事件（路由 unwrap 后转给用户，和 DeBank 显示的到账只差路由手续费）。
+BSC 现在约 19 万块/天，每个窗口约 2 秒，70 天大约 1 小时，适合挂后台；中断后重跑同一命令会接着扫（缓存在 `~/.cache/wallet-trace/rpc/`）。
+看不到的东西：纯 BNB 转账（充提）、失败交易、bonding curve 合约直接付 BNB 的卖出（会标 `unpriced`）。
+
+### BSC 急用：DeBank 兜底（只有最近约 1000 条）
 
 1. 浏览器打开 `https://debank.com/profile/<addr>/history?chain=bsc`
 2. DevTools Console 里反复执行，把历史翻到足够久（匿名大约能翻 1200 条，约 2 到 3 个月）：

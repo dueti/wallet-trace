@@ -30,14 +30,25 @@ python3 ~/.claude/skills/wallet-trace/scripts/wallet_trace.py <address> --no-fet
 | 链 | 数据源 |
 |---|---|
 | eth / arb | Etherscan V2（免费 key，已验证）；没 key 走 Blockscout 公共 API（已验证） |
-| base | Blockscout 公共 API（已验证）。Etherscan 免费版不覆盖 base，脚本会自动回退 |
-| bsc | **没有免费 API**（Etherscan 免费版明确不覆盖 bsc，BscScan 网页有人机验证）→ 走下面 DeBank 兜底 |
+| base | Blockscout 公共 API（已验证，无 key）。Etherscan 免费版不覆盖 base |
+| bsc | 没有免费索引 API（Etherscan 免费版不覆盖，Moralis 已转付费）。**`--scan`：纯公共 RPC 扫日志，无 key、全量、可断点续跑，约 1 小时/70 天**；急用就走 DeBank 兜底（只有最近约 1000 条）；有付费 key（Moralis / Etherscan 付费版）则直连 |
 | solana | 公共 RPC（已验证，慢：每笔 0.35s；设 `SOLANA_RPC_URL` 用 Helius 等更快） |
 
 key 放三处任一：环境变量 `ETHERSCAN_API_KEY`、文件 `~/.config/wallet-trace/etherscan.key`、钥匙串 service `etherscan-api`。
-付费版覆盖 bsc/base 的话加 `ETHERSCAN_PAID=1`。
+付费 key 可选：Moralis 放 `MORALIS_API_KEY` 或 `~/.config/wallet-trace/moralis.key`；Etherscan 付费版加 `ETHERSCAN_PAID=1`。
 
-### BSC 无 key 时的 DeBank 兜底（已验证）
+### BSC 无 key 全量：`--scan`（已验证）
+
+```bash
+python3 scripts/wallet_trace.py <addr> --chain bsc --scan --days 80
+```
+原理：bloXroute 公共节点允许按 topic 过滤、一次 5000 块的 `eth_getLogs`，扫钱包作为 from/to 的所有 ERC20 Transfer，
+再逐笔拉 receipt 还原：token 腿来自 Transfer 事件，付出的 BNB 来自 tx.value，收到的 BNB 来自同一笔里 WBNB 的 Withdrawal 事件
+（路由先 unwrap 再转给用户，和 DeBank 显示的到账只差路由手续费）。BSC 现在约 19 万块/天，每窗口约 2 秒，70 天约 1 小时；
+中间断了重跑同一命令会接着扫（缓存在 `~/.cache/wallet-trace/rpc/`）。看不到的：纯 BNB 转账（充提）、失败交易、
+bonding curve 合约直接付 BNB 的卖出（会标 `unpriced`，usd=0）。适合挂后台跑，跑完再 `--no-fetch` 重算。
+
+### BSC 急用时的 DeBank 兜底（已验证）
 
 1. 浏览器打开 `https://debank.com/profile/<addr>/history?chain=bsc`（Claude Code 用 Browser pane，人工用 DevTools Console 也一样）。
 2. 在控制台反复执行下面这段点 Load More（Claude 的 javascript_tool 每次 ≤22 下，否则 45s 超时）：
@@ -51,7 +62,7 @@ key 放三处任一：环境变量 `ETHERSCAN_API_KEY`、文件 `~/.config/walle
    匿名访问大约翻到 1200 条就停了（约 2–3 个月），再点没用。
 3. 取正文存成文件：`copy(document.querySelector('main').innerText)` 粘贴到 dump.txt；Claude 环境下用 `.slice(0,66000)` / `.slice(66000)` 分两次返回（超长结果会被存成 JSON 字符串文件，脚本能直接吃），再拼成一个文件。
 4. 跑：`wallet_trace.py <addr> --chain bsc --debank-dump dump.txt --dump-time "YYYY-MM-DD HH:MM"`（dump-time 用来换算"x hrs ago"）。
-   注意 DeBank 只给币名不给合约，同名币会被合并；报告里会标注。
+   注意 DeBank 只给币名不给合约，同名币会被合并；报告里会标注。实测 Claude Browser pane 里 DeBank 显示的时间比北京时间快 1 小时，`--tz 9` 才对得上链上时间。
 
 ## 报告怎么读、怎么讲
 

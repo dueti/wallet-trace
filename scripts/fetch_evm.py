@@ -2,13 +2,14 @@
 
 Sources (in order):
   1. Etherscan V2 (ETHERSCAN_API_KEY; free plan = eth/arb only, bsc/base need paid + ETHERSCAN_PAID=1)
-  2. Blockscout public API (no key; eth/base/arb — NOT bsc)
+  2. Moralis (MORALIS_API_KEY, free plan covers bsc/base/eth/arb) — used for chains Etherscan can't serve
+  3. Blockscout public API (no key; eth/base/arb — NOT bsc)
 Returns the unified trades.json structure used by analyze.py.
 """
 import time
 from collections import defaultdict
 
-from common import EVM_CHAINS, http_json, etherscan_key_for, make_trade, make_transfer, log
+from common import EVM_CHAINS, MORALIS_CHAIN, http_json, etherscan_key_for, moralis_key, make_trade, make_transfer, log
 from prices import NativePrice
 
 
@@ -51,6 +52,44 @@ def _etherscan(chain, address, key, since_ts):
     if since_ts:
         for k in raw:
             raw[k] = [x for x in raw[k] if x["ts"] >= since_ts]
+    return raw
+
+
+def _moralis(chain, address, key, since_ts, max_pages=400):
+    """Moralis wallet history (free plan covers bsc/base/eth/arb). One page = 100 txs with decoded transfers."""
+    raw = {"token_transfers": [], "txs": [], "internal": []}
+    base = f"https://deep-index.moralis.io/api/v2.2/wallets/{address}/history?chain={MORALIS_CHAIN[chain]}&order=DESC&limit=100"
+    if since_ts:
+        from datetime import datetime, timezone
+        base += "&from_date=" + datetime.fromtimestamp(since_ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cursor = None
+    for page in range(max_pages):
+        url = base + (f"&cursor={cursor}" if cursor else "")
+        r = http_json(url, headers={"X-API-Key": key}, retries=4)
+        if "result" not in r:
+            raise RuntimeError(f"moralis: {str(r)[:200]}")
+        for x in r["result"]:
+            ts = _iso_ts(x["block_timestamp"])
+            h = x["hash"]
+            frm = (x.get("from_address") or "").lower()
+            to = (x.get("to_address") or "").lower()
+            raw["txs"].append({"tx": h, "ts": ts, "from": frm, "to": to, "value": 0.0,
+                               "ok": str(x.get("receipt_status")) == "1", "method": (x.get("method_label") or x.get("category") or "")[:40]})
+            for n in x.get("native_transfers") or []:
+                raw["internal"].append({"tx": h, "ts": ts, "from": (n.get("from_address") or "").lower(), "to": (n.get("to_address") or "").lower(),
+                                        "value": float(n.get("value_formatted") or 0)})
+            for t in x.get("erc20_transfers") or []:
+                try:
+                    v = float(t.get("value_formatted") or 0)
+                except ValueError:
+                    v = 0.0
+                raw["token_transfers"].append({"tx": h, "ts": ts, "from": (t.get("from_address") or "").lower(), "to": (t.get("to_address") or "").lower(),
+                                               "token_addr": (t.get("address") or "").lower(), "symbol": t.get("token_symbol") or "?", "value": v})
+        cursor = r.get("cursor")
+        log(f"[moralis] page {page+1}: {len(r['result'])} txs, total {len(raw['txs'])}")
+        if not cursor or not r["result"]:
+            break
+        time.sleep(0.3)
     return raw
 
 
@@ -100,6 +139,10 @@ def _blockscout(chain, address, since_ts, max_pages=200):
 
 def fetch_raw(chain, address, since_ts=None):
     address = address.lower()
+    mk = moralis_key()
+    if mk and chain in MORALIS_CHAIN and not etherscan_key_for(chain):
+        log(f"[evm] {chain}: moralis")
+        return _moralis(chain, address, mk, since_ts), "moralis"
     key = etherscan_key_for(chain)
     if key:
         log(f"[evm] {chain}: etherscan v2")
@@ -112,7 +155,10 @@ def fetch_raw(chain, address, since_ts=None):
     if EVM_CHAINS[chain]["blockscout"]:
         log(f"[evm] {chain}: blockscout (no usable etherscan key for this chain)")
         return _blockscout(chain, address, since_ts), "blockscout"
-    raise RuntimeError(f"{chain}: no data source. Etherscan free plan does not cover {chain}; use the DeBank fallback (--debank-dump) or a paid key with ETHERSCAN_PAID=1.")
+    if mk and chain in MORALIS_CHAIN:
+        log(f"[evm] {chain}: moralis")
+        return _moralis(chain, address, mk, since_ts), "moralis"
+    raise RuntimeError(f"{chain}: no data source. Set MORALIS_API_KEY (free) or use the DeBank fallback (--debank-dump).")
 
 
 # ------------------------------------------------------------------ rebuild trades
@@ -124,7 +170,7 @@ def build_trades(chain, address, raw):
     stables = cfg["stables"]
     px = NativePrice(cfg["cg"])
 
-    by_tx = defaultdict(lambda: {"ts": 0, "legs": [], "sender": None, "ok": True, "method": ""})
+    by_tx = defaultdict(lambda: {"ts": 0, "legs": [], "sender": None, "ok": True, "method": "", "nlogs": 0})
     for t in raw["token_transfers"]:
         e = by_tx[t["tx"]]
         e["ts"] = t["ts"]
@@ -137,6 +183,7 @@ def build_trades(chain, address, raw):
         e["ts"] = t["ts"]
         e["ok"] = t.get("ok", True)
         e["method"] = t.get("method", "")
+        e["nlogs"] = t.get("nlogs", 0)
         if t["from"] == address:
             e["sender"] = address
             if t["value"] > 0:
@@ -220,6 +267,12 @@ def build_trades(chain, address, raw):
             trades.append(make_trade(ts, h, "QUOTE_SWAP", f"{out_q[0][2]}->{in_q[0][2]}", out_q[0][1], out_q[0][3], in_q[0][2], in_q[0][3], out_q_usd, ""))
             continue
         if outs and not ins:
+            if e["nlogs"] >= 3 and out_t and not out_q:
+                # contract interaction that took our token and gave nothing we can see: a sell whose proceeds
+                # were paid as raw native value (no WBNB event). Keep it as a SELL with usd=0 so the round closes.
+                src = sorted(out_t, key=lambda l: l[3], reverse=True)[0]
+                trades.append(make_trade(ts, h, "SELL", src[2], src[1], src[3], "?", 0.0, 0.0, "unpriced"))
+                continue
             for l in outs:
                 usd = usd_of(l[1], l[3], ts) if is_quote(l[1]) else 0.0
                 transfers.append(make_transfer(ts, h, "out", l[2], l[3], usd, l[4], "send"))
