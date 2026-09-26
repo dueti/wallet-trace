@@ -23,7 +23,8 @@ WITHDRAWAL = "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65
 DEPOSIT = "0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c"     # WETH9 Deposit(dst, wad)
 
 SCAN_RPC = {"bsc": ["https://bsc.rpc.blxrbdn.com"]}
-CALL_RPC = {"bsc": ["https://bsc-dataseed.bnbchain.org", "https://bsc-dataseed1.defibit.io", "https://bsc-dataseed1.ninicoin.io", "https://bsc.rpc.blxrbdn.com"]}
+CALL_RPC = {"bsc": ["https://bsc-dataseed.bnbchain.org", "https://bsc-dataseed1.bnbchain.org", "https://bsc-dataseed2.bnbchain.org", "https://bsc-dataseed3.bnbchain.org",
+                    "https://bsc-dataseed4.bnbchain.org", "https://bsc-dataseed1.defibit.io", "https://bsc-dataseed2.defibit.io", "https://bsc-dataseed1.ninicoin.io", "https://bsc-dataseed2.ninicoin.io"]}
 WINDOW = 5000
 CACHE = os.path.expanduser("~/.cache/wallet-trace/rpc")
 
@@ -34,7 +35,7 @@ class Node:
         self.i = 0
         self.lock = threading.Lock()
 
-    def call(self, method, params, retries=6, timeout=90):
+    def call(self, method, params, retries=10, timeout=60):
         last = None
         for k in range(retries):
             with self.lock:
@@ -76,6 +77,7 @@ def scan(chain, address, start, end, cache_dir, threads=8, progress=True):
     done = set()
     if os.path.exists(done_path):
         done = {int(x) for x in open(done_path).read().split()}
+    start -= start % WINDOW  # align windows so a re-run with a different --days reuses the cache
     wins = [w for w in range(start, end + 1, WINDOW) if w not in done]
     if progress:
         log(f"[scan] {chain} {address[:8]} blocks {start}-{end}: {len(wins)} windows to go ({len(done)} cached), ~{len(wins)/0.55/60:.0f} min")
@@ -188,8 +190,15 @@ def decode(chain, address, txs, cache_dir, threads=6, progress=True):
                 log(f"[decode] {cnt[0]} receipts fetched, {time.time()-t0:.0f}s")
         return d
 
+    def safe(h):
+        try:
+            return fetch(h)
+        except Exception as e:
+            log(f"[decode] skip {h[:12]}: {str(e)[:60]}")
+            return None
+
     with cf.ThreadPoolExecutor(threads) as ex:
-        recs = list(ex.map(fetch, hashes))
+        recs = [r for r in ex.map(safe, hashes) if r]
     # block timestamps
     need = sorted({r["blk"] for r in recs if r["blk"] not in blk_ts})
     if progress:
